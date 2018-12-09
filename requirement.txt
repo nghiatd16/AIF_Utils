@@ -1,3 +1,4 @@
 tensorflow
 numpy
-psutil
+opencv-python
+opencv-contrib-python

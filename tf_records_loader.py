@@ -54,7 +54,6 @@ If your data set involves bounding boxes, please look at build_imagenet_data.py.
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-
 from datetime import datetime
 import os
 import random
@@ -126,9 +125,11 @@ def init_flags(train_directory, validation_directory, output_directory, labels_f
     if train_shards is None:
         train_num_files, train_labels = _observe_data(train_directory)
         train_shards = int(min(math.ceil(train_num_files/1024), 1024))
+        if train_shards % 2 != 0 and train_shards > 3: train_shards -= 1
     if validation_shards is None:
         validation_num_files, validation_labels = _observe_data(train_directory)
         validation_shards = int(min(math.ceil(validation_num_files/128), 128))
+        if validation_shards % 2 != 0 and validation_shards > 3: validation_shards -= 1
         if labels_file is None:
             labels_file = "{}/labels_file.txt".format(os.path.join(validation_directory, os.pardir))
             _write_list_string_to_file(labels_file, validation_labels)
@@ -453,20 +454,42 @@ def _process_dataset(name, directory, num_shards, labels_file):
 
 
 def to_TFRecords(train_directory, validation_directory, output_directory, labels_file=None, train_shards=None, validation_shards=None, worker=None):
-    if (train_shards is not None) and (worker is not None):
-        assert not train_shards % worker, (
-        'Please make the number of workers commensurate with train_shards')
-    if (validation_shards is not None) and (worker is not None):
-        assert not validation_shards % worker, (
-            'Please make the number of workers commensurate with '
-            'validation_shards')
-    global FLAGS
-    FLAGS = init_flags(train_directory, validation_directory, output_directory, labels_file, train_shards, validation_shards, worker)
-    _process_dataset('validation', FLAGS.validation_directory,
-                   FLAGS.validation_shards, FLAGS.labels_file)
-    _process_dataset('train', FLAGS.train_directory,
-                   FLAGS.train_shards, FLAGS.labels_file)
-to_TFRecords("/home/nghiatd/workspace/dataset/digit/train", "/home/nghiatd/workspace/dataset/digit/test", "/home/nghiatd/workspace/dataset/digit/digit_TFR")
+  if (train_shards is not None) and (worker is not None):
+      assert not train_shards % worker, (
+      'Please make the number of workers commensurate with train_shards')
+  if (validation_shards is not None) and (worker is not None):
+      assert not validation_shards % worker, (
+          'Please make the number of workers commensurate with '
+          'validation_shards')
+  global FLAGS
+  FLAGS = init_flags(train_directory, validation_directory, output_directory, labels_file, train_shards, validation_shards, worker)
+  _process_dataset('validation', FLAGS.validation_directory,
+                  FLAGS.validation_shards, FLAGS.labels_file)
+  _process_dataset('train', FLAGS.train_directory,
+                  FLAGS.train_shards, FLAGS.labels_file)
+
+def to_TFDataset(directory, process_fn=None, num_parallel_readers=4, buffer_size=1024, batch_size=32, prefetch_buffer_size=64):
+  def parse_fn(example):
+    "Parse TFExample records and perform simple data augmentation."
+    example_fmt = {
+      "image": tf.io.FixedLengthFeature((), tf.string, ""),
+      "label": tf.io.FixedLengthFeature((), tf.string, -1)
+    }
+    parsed = tf.parse_single_example(example, example_fmt)
+    image = tf.image.decode_image(parsed["image"])
+    if process_fn is not None:
+      image = process_fn(image)  # augments image using slice, reshape, resize_bilinear
+    return image, parsed["label"]
+  files = tf.data.Dataset.list_files(os.path.join(directory, "train-*"))
+  dataset = files.apply(tf.contrib.data.parallel_interleave(
+    tf.data.TFRecordDataset, cycle_length=num_parallel_readers))
+  dataset = dataset.apply(
+    tf.contrib.data.shuffle_and_repeat(buffer_size=buffer_size))
+  dataset = dataset.apply(tf.contrib.data.map_and_batch(
+    map_func=parse_fn, batch_size=batch_size))
+  dataset = dataset.prefetch(buffer_size=prefetch_buffer_size)
+  return dataset
+# to_TFRecords("/home/nghiatd/workspace/dataset/digit/train", "/home/nghiatd/workspace/dataset/digit/test", "/home/nghiatd/workspace/dataset/digit/digit_TFR")
 # def main(unused_argv):
 #   assert not FLAGS.train_shards % FLAGS.num_threads, (
 #       'Please make the FLAGS.num_threads commensurate with FLAGS.train_shards')
@@ -484,3 +507,5 @@ to_TFRecords("/home/nghiatd/workspace/dataset/digit/train", "/home/nghiatd/works
 
 # if __name__ == '__main__':
 #   tf.app.run()
+dataset = to_TFDataset(directory="/home/nghiatd/workspace/dataset/digit/digit_TFR")
+print(dataset)
