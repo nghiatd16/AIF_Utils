@@ -3,6 +3,7 @@ import os
 import subprocess
 import time
 from multiprocessing import Pool
+from sklearn.model_selection import train_test_split
 def find_images(path):
     path = os.path.abspath(path)
     assert os.path.isdir(path), ("No such a directory")
@@ -43,7 +44,8 @@ def _execute_cmd(command):
 def _execute_image_profn(process_fn, input_path, output_path):
     img = cv2.imread(input_path)
     img = process_fn(img)
-    cv2.imwrite(output_path, img)
+    if img is not None:
+        cv2.imwrite(output_path, img)
 
 def resize_dataset(lst_imgs, desired_size, output_dir=None, worker=None):
     if worker is None:
@@ -107,3 +109,24 @@ def multi_processing_dataset(dataset, process_fn, output_dir=None, worker=None):
         if label == "root_path": continue
         lst_imgs = dataset[label]
         multi_processing_list(lst_imgs, process_fn, os.path.join(output_dir, label))
+def __deffn(img):
+    return img
+def split_train_test_dataset(dataset, test_size, output_dir=None, worker=None):
+    if output_dir is None:
+        dir_name = dataset['root_path']
+        output_dir = os.path.join(os.path.dirname(dir_name), "{}_OutFolder".format(time.time()))
+        os.makedirs(output_dir)
+    for label in dataset:
+        if label == 'root_path':
+            continue
+        img_paths = dataset[label]
+        img_labels = [label]*len(img_paths)
+        X_train, X_test, y_train, y_test = train_test_split(img_paths, img_labels, test_size=test_size)
+        # print(X_test[0])
+        # break
+        lst_train_output_dir = os.path.join(output_dir, os.path.dirname(os.path.dirname(label)), "{}_train".format(label))
+        print(lst_train_output_dir)
+        multi_processing_list(X_train, __deffn, lst_train_output_dir, worker)
+        lst_test_output_dir = os.path.join(output_dir, os.path.dirname(os.path.dirname(label)), "{}_test".format(label))
+        print(lst_test_output_dir)
+        multi_processing_list(X_test, __deffn, lst_test_output_dir, worker)
