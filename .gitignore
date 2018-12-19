@@ -3,3 +3,7 @@
 *.pb
 *.hd5f
 *.ascii
+__pycache__
+*.jpg
+applications/CheckPoint
+test*

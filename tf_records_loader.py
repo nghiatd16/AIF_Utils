@@ -63,6 +63,7 @@ import threading
 import numpy as np
 import tensorflow as tf
 import math
+import json
 # Assumes that the file contains entries as such:
 #   dog
 #   cat
@@ -73,48 +74,48 @@ import math
 
 FLAGS = None
 def _calculate_directory_size(path):
-    assert os.path.isdir(path), ("No such a directory")
-    cwd = os.getcwd()
-    os.chdir(path)
-    directory_size = sum([os.path.getsize(f) for f in os.listdir('.') if os.path.isfile(f)])
-    os.chdir(cwd)
-    return directory_size
+  assert os.path.isdir(path), ("No such a directory")
+  cwd = os.getcwd()
+  os.chdir(path)
+  directory_size = sum([os.path.getsize(f) for f in os.listdir('.') if os.path.isfile(f)])
+  os.chdir(cwd)
+  return directory_size
 
 
 def _observe_data(path):
-    assert os.path.isdir(path), ("No such directory")
-    cwd = os.getcwd()
-    os.chdir(path)
-    num_files = 0
-    sub_directories = sorted(os.listdir())
-    labels = []
-    for subdir in sub_directories:
-        sub_dir_path = os.path.join(path, subdir)
-        num_files += len(os.listdir(sub_dir_path))
-        labels.append(os.path.basename(sub_dir_path))
-    os.chdir(cwd)
-    return num_files, labels
+  assert os.path.isdir(path), ("No such directory")
+  cwd = os.getcwd()
+  os.chdir(path)
+  num_files = 0
+  sub_directories = sorted(os.listdir())
+  labels = []
+  for subdir in sub_directories:
+      sub_dir_path = os.path.join(path, subdir)
+      num_files += len(os.listdir(sub_dir_path))
+      labels.append(os.path.basename(sub_dir_path))
+  os.chdir(cwd)
+  return num_files, labels
 
 
 def _write_list_string_to_file(path, lst):
-    f = open(path, "w")
-    for text in lst:
-        f.write("{}\n".format(text))
-    f.close()
+  f = open(path, "w")
+  for text in lst:
+      f.write("{}\n".format(text))
+  f.close()
 
 
 def _check_compatible_worker(train_shards, validation_shards, worker):
-    if worker is None:
-        return False
-    if train_shards is None:
-        return False
-    if validation_shards is None:
-        return False
-    if not train_shards % worker:
-        return False
-    if not validation_shards % worker:
-        return False
-    return True
+  if worker is None:
+    return False
+  if train_shards is None:
+    return False
+  if validation_shards is None:
+    return False
+  if not train_shards % worker:
+    return False
+  if not validation_shards % worker:
+    return False
+  return True
 
 
 def init_flags(train_directory, validation_directory, output_directory, labels_file=None, train_shards=None, validation_shards=None, worker=None):
@@ -126,13 +127,14 @@ def init_flags(train_directory, validation_directory, output_directory, labels_f
         train_num_files, train_labels = _observe_data(train_directory)
         train_shards = int(min(math.ceil(train_num_files/1024), 1024))
         if train_shards % 2 != 0 and train_shards > 3: train_shards -= 1
+    validation_num_files, validation_labels = _observe_data(validation_directory)
+    num_classes = len(validation_labels)
     if validation_shards is None:
-        validation_num_files, validation_labels = _observe_data(train_directory)
-        validation_shards = int(min(math.ceil(validation_num_files/128), 128))
-        if validation_shards % 2 != 0 and validation_shards > 3: validation_shards -= 1
-        if labels_file is None:
-            labels_file = "{}/labels_file.txt".format(os.path.join(validation_directory, os.pardir))
-            _write_list_string_to_file(labels_file, validation_labels)
+      validation_shards = int(min(math.ceil(validation_num_files/128), 128))
+    if validation_shards % 2 != 0 and validation_shards > 3: validation_shards -= 1
+    if labels_file is None:
+        labels_file = "{}/labels_file.txt".format(os.path.join(validation_directory, os.pardir))
+        _write_list_string_to_file(labels_file, validation_labels)
     if not _check_compatible_worker(train_shards, validation_shards, worker):
         shards_gcd = gcd(train_shards, validation_shards)
         worker = gcd(shards_gcd, os.cpu_count())
@@ -151,6 +153,7 @@ def init_flags(train_directory, validation_directory, output_directory, labels_f
     tf.app.flags.DEFINE_integer('num_threads', worker,
                             'Number of threads to preprocess the images.')
     tf.app.flags.DEFINE_string('labels_file', labels_file, 'Labels file')
+    tf.app.flags.DEFINE_integer('num_classes', num_classes, 'Number of classes')
     return tf.app.flags.FLAGS
 
 
@@ -192,7 +195,8 @@ def _convert_to_example(filename, image_buffer, label, text, height, width):
       'image/class/text': _bytes_feature(tf.compat.as_bytes(text)),
       'image/format': _bytes_feature(tf.compat.as_bytes(image_format)),
       'image/filename': _bytes_feature(tf.compat.as_bytes(os.path.basename(filename))),
-      'image/encoded': _bytes_feature(tf.compat.as_bytes(image_buffer))}))
+      'image/encoded': _bytes_feature(tf.compat.as_bytes(image_buffer)),
+      'image/num_classes': _int64_feature(FLAGS.num_classes)}))
   return example
 
 
@@ -407,9 +411,8 @@ def _find_image_files(data_dir, labels_file):
   labels = []
   filenames = []
   texts = []
-
   # Leave label index 0 empty as a background class.
-  label_index = 1
+  label_index = 0
 
   # Construct the list of JPEG files and labels.
   for text in unique_labels:
@@ -450,10 +453,18 @@ def _process_dataset(name, directory, num_shards, labels_file):
     labels_file: string, path to the labels file.
   """
   filenames, texts, labels = _find_image_files(directory, labels_file)
+  mapping = {}
+  for i in range(len(texts)):
+    mapping[texts[i]] = labels[i]
+  if name == 'train':
+    out_path = os.path.join(FLAGS.output_directory, "_mapping.json")
+    fo = open(out_path, "w")
+    json.dump(mapping, fo)
+    fo.close()
   _process_image_files(name, filenames, texts, labels, num_shards)
 
 
-def to_TFRecords(train_directory, validation_directory, output_directory, labels_file=None, train_shards=None, validation_shards=None, worker=None):
+def Folders_to_TFRecords(train_directory, validation_directory, output_directory, labels_file=None, train_shards=None, validation_shards=None, worker=None):
   if (train_shards is not None) and (worker is not None):
       assert not train_shards % worker, (
       'Please make the number of workers commensurate with train_shards')
@@ -468,44 +479,61 @@ def to_TFRecords(train_directory, validation_directory, output_directory, labels
   _process_dataset('train', FLAGS.train_directory,
                   FLAGS.train_shards, FLAGS.labels_file)
 
-def to_TFDataset(directory, process_fn=None, num_parallel_readers=4, buffer_size=1024, batch_size=32, prefetch_buffer_size=64):
+def TFRecords_to_TFDataset(directory, format_file, process_fn=None, worker=None, buffer_size=1024):
+  '''
+    Args: 
+    format_file : one of ['train-*', 'validation-*'] - choose loading dataset
+  '''
   def parse_fn(example):
     "Parse TFExample records and perform simple data augmentation."
-    example_fmt = {
-      "image": tf.io.FixedLengthFeature((), tf.string, ""),
-      "label": tf.io.FixedLengthFeature((), tf.string, -1)
-    }
-    parsed = tf.parse_single_example(example, example_fmt)
-    image = tf.image.decode_image(parsed["image"])
+    feature={
+      'image/height': tf.FixedLenFeature([], tf.int64),
+      'image/width': tf.FixedLenFeature([], tf.int64),
+      'image/colorspace': tf.FixedLenFeature([], tf.string),
+      'image/channels': tf.FixedLenFeature([], tf.int64),
+      'image/class/label': tf.FixedLenFeature([], tf.int64),
+      'image/class/text': tf.FixedLenFeature([], tf.string),
+      'image/format': tf.FixedLenFeature([], tf.string),
+      'image/filename': tf.FixedLenFeature([], tf.string),
+      'image/encoded': tf.FixedLenFeature([], tf.string),
+      'image/num_classes': tf.FixedLenFeature([], tf.int64)
+      }
+    parsed = tf.parse_single_example(example, feature)
+    image = tf.image.decode_image(parsed["image/encoded"])
+    label = parsed["image/class/label"]
     if process_fn is not None:
       image = process_fn(image)  # augments image using slice, reshape, resize_bilinear
-    return image, parsed["label"]
-  files = tf.data.Dataset.list_files(os.path.join(directory, "train-*"))
-  dataset = files.apply(tf.contrib.data.parallel_interleave(
-    tf.data.TFRecordDataset, cycle_length=num_parallel_readers))
-  dataset = dataset.apply(
-    tf.contrib.data.shuffle_and_repeat(buffer_size=buffer_size))
-  dataset = dataset.apply(tf.contrib.data.map_and_batch(
-    map_func=parse_fn, batch_size=batch_size))
-  dataset = dataset.prefetch(buffer_size=prefetch_buffer_size)
+    return image, label
+  if worker is None:
+    worker = os.cpu_count()
+  file_names = tf.data.Dataset.list_files(os.path.join(directory, format_file))
+  dataset = tf.data.TFRecordDataset(file_names, buffer_size=buffer_size, num_parallel_reads=worker).map(parse_fn)
   return dataset
-# to_TFRecords("/home/nghiatd/workspace/dataset/digit/train", "/home/nghiatd/workspace/dataset/digit/test", "/home/nghiatd/workspace/dataset/digit/digit_TFR")
-# def main(unused_argv):
-#   assert not FLAGS.train_shards % FLAGS.num_threads, (
-#       'Please make the FLAGS.num_threads commensurate with FLAGS.train_shards')
-#   assert not FLAGS.validation_shards % FLAGS.num_threads, (
-#       'Please make the FLAGS.num_threads commensurate with '
-#       'FLAGS.validation_shards')
-#   print('Saving results to %s' % FLAGS.output_directory)
+def TFDataset_to_InputFn(dataset, shape, num_classes, batch_size, shuffle_size=1024, prefetch_size=32, repeat_times=None):
+  def get_inputs(dataset, shape, num_classes, batch_size, shuffle_size, prefetch_size, repeat):
+    # global dataset
+    dataset = dataset.shuffle(shuffle_size)
+    dataset = dataset.repeat(repeat_times)  # repeat indefinitely
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(prefetch_size)
+    image, label = dataset.make_one_shot_iterator().get_next()
+    image = tf.reshape(image, shape)
+    label = tf.one_hot(label, num_classes)
+    # print(features)
+    # print(label)
+    return image, label
+  return lambda:get_inputs(dataset,shape, num_classes, batch_size, shuffle_size, prefetch_size, repeat_times)
 
-#   # Run it!
-#   _process_dataset('validation', FLAGS.validation_directory,
-#                    FLAGS.validation_shards, FLAGS.labels_file)
-#   _process_dataset('train', FLAGS.train_directory,
-#                    FLAGS.train_shards, FLAGS.labels_file)
+# def Image_to_InputFn(image_path):
+#   with tf.gfile.GFile(filename, 'rb') as f:
+#     image_data = f.read()
+#   return lambda:get_inputs(dataset,shape, num_classes, batch_size, shuffle_size, prefetch_size, repeat_times)
+Folders_to_TFRecords("/home/nghiatd/workspace/dataset/print_3149/train", 
+                    "/home/nghiatd/workspace/dataset/print_3149/test", 
+                    "/home/nghiatd/workspace/dataset/print_3149/print_3149_tfr")
 
-
-# if __name__ == '__main__':
-#   tf.app.run()
-dataset = to_TFDataset(directory="/home/nghiatd/workspace/dataset/digit/digit_TFR")
-print(dataset)
+# dataset = TFRecords_to_TFDataset(directory="/home/nghiatd/workspace/dataset/digit/digit_TFR")
+# input_fn = TFDataset_to_InputFn(dataset, (50,50,1), 10 , 2)
+# image, label = input_fn()
+# print(image)
+# print(label)
