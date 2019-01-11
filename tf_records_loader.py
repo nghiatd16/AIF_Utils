@@ -169,7 +169,7 @@ def _bytes_feature(value):
   return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
 
 
-def _convert_to_example(filename, image_buffer, label, text, height, width):
+def _convert_image_to_example(filename, image_buffer, label, text, height, width):
   """Build an Example proto for an example.
   Args:
     filename: string, path to an image file, e.g., '/path/to/example.JPG'
@@ -199,6 +199,13 @@ def _convert_to_example(filename, image_buffer, label, text, height, width):
       'image/num_classes': _int64_feature(FLAGS.num_classes)}))
   return example
 
+def _convert_sound_to_example(filename, buffer, label):
+  example = tf.train.Example(features=tf.train.Features(feature={
+      'sound/buffer': _bytes_feature(tf.compat.as_bytes(buffer)),
+      'sound/filename': _bytes_feature(tf.compat.as_bytes(os.path.basename(filename))),
+      'image/label': _bytes_feature(tf.compat.as_bytes(label))
+      }))
+  return example
 
 class ImageCoder(object):
   """Helper class that provides TensorFlow image coding utilities."""
@@ -226,7 +233,6 @@ class ImageCoder(object):
     assert len(image.shape) == 3
     assert image.shape[2] == 3
     return image
-
 
 def _is_png(filename):
   """Determine if a file contains a PNG format image.
@@ -317,7 +323,7 @@ def _process_image_files_batch(coder, thread_index, ranges, name, filenames,
         print('SKIPPED: Unexpected error while decoding %s.' % filename)
         continue
 
-      example = _convert_to_example(filename, image_buffer, label,
+      example = _convert_image_to_example(filename, image_buffer, label,
                                     text, height, width)
       writer.write(example.SerializeToString())
       shard_counter += 1
@@ -528,9 +534,9 @@ def TFDataset_to_InputFn(dataset, shape, num_classes, batch_size, shuffle_size=1
 #   with tf.gfile.GFile(filename, 'rb') as f:
 #     image_data = f.read()
 #   return lambda:get_inputs(dataset,shape, num_classes, batch_size, shuffle_size, prefetch_size, repeat_times)
-Folders_to_TFRecords("/home/nghiatd/workspace/dataset/print_3149/train", 
-                    "/home/nghiatd/workspace/dataset/print_3149/test", 
-                    "/home/nghiatd/workspace/dataset/print_3149/print_3149_tfr")
+# Folders_to_TFRecords("/home/nghiatd/workspace/dataset/print_3149/train", 
+#                     "/home/nghiatd/workspace/dataset/print_3149/test", 
+#                     "/home/nghiatd/workspace/dataset/print_3149/print_3149_tfr")
 
 # dataset = TFRecords_to_TFDataset(directory="/home/nghiatd/workspace/dataset/digit/digit_TFR")
 # input_fn = TFDataset_to_InputFn(dataset, (50,50,1), 10 , 2)
