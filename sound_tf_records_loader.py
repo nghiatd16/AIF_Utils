@@ -6,6 +6,7 @@ import os
 import random
 import sys
 import threading
+from multiprocessing import Pool, Value
 
 import numpy as np
 import tensorflow as tf
@@ -14,6 +15,21 @@ import json
 from tensorflow.contrib.framework.python.ops import audio_ops as contrib_audio
 
 FLAGS = None
+counter = None
+
+def _observe_data(path):
+    assert os.path.isdir(path), ("No such directory")
+    cwd = os.getcwd()
+    os.chdir(path)
+    num_files = 0
+    sub_directories = sorted(os.listdir())
+    labels = []
+    for subdir in sub_directories:
+        sub_dir_path = os.path.join(path, subdir)
+        num_files += len(os.listdir(sub_dir_path))
+        labels.append(os.path.basename(sub_dir_path))
+    os.chdir(cwd)
+    return num_files, labels
 
 def _check_compatible_worker(train_shards, validation_shards, worker):
     if worker is None:
@@ -22,19 +38,18 @@ def _check_compatible_worker(train_shards, validation_shards, worker):
         return False
     if validation_shards is None:
         return False
-    if not train_shards % worker:
+    if train_shards % worker != 0:
         return False
-    if not validation_shards % worker:
+    if validation_shards % worker != 0:
         return False
     return True
 
 
-def init_flags(train_directory, validation_directory, output_directory, train_shards, validation_shards, worker=None):
+def init_flags(train_directory, validation_directory, output_directory, train_shards, validation_shards, labels_file=None, worker=None):
     def gcd(x, y):
         while y != 0:
             (x, y) = (y, x % y)
         return x
-
     if not _check_compatible_worker(train_shards, validation_shards, worker):
         shards_gcd = gcd(train_shards, validation_shards)
         worker = gcd(shards_gcd, os.cpu_count())
@@ -69,7 +84,7 @@ def _encode_example(filename, buffer, label):
     example = tf.train.Example(features=tf.train.Features(feature={
         'sound/buffer': _bytes_feature(tf.compat.as_bytes(buffer)),
         'sound/filename': _bytes_feature(tf.compat.as_bytes(os.path.basename(filename))),
-        'sound/label': _bytes_feature(tf.compat.as_bytes(label))
+        'sound/label': _bytes_feature(tf.compat.as_bytes(str(label)))
         }))
     return example
 
@@ -123,55 +138,117 @@ def _process_sound_files_batch(thread_index, ranges, name, filenames,
         (datetime.now(), thread_index, counter, num_files_in_thread))
     sys.stdout.flush()
 
-def _process_sound_files(name, filenames, labels, num_shards):
-    """Process and save list of sounds as TFRecord of Example protos.
+def _find_dataset(data_dir, labels_file):
+    """Build a list of all images files and labels in the data set.
     Args:
-        name: string, unique identifier specifying the data set ('validation' or 'train)
-        filenames: list of strings; each string is a path to an image file
-        labels: label for dataset
-        num_shards: integer number of shards for this data set.
+        data_dir: string, path to the root directory of images.
+        Assumes that the image data set resides in JPEG files located in
+        the following directory structure.
+            data_dir/dog/another-image.JPEG
+            data_dir/dog/my-image.jpg
+        where 'dog' is the label associated with these images.
+        labels_file: string, path to the labels file.
+        The list of valid labels are held in this file. Assumes that the file
+        contains entries as such:
+            dog
+            cat
+            flower
+        where each line corresponds to a label. We map each label contained in
+        the file to an integer starting with the integer 0 corresponding to the
+        label contained in the first line.
+    Returns:
+        filenames: list of strings; each string is a path to an image file.
+        texts: list of strings; each string is the class, e.g. 'dog'
+        labels: list of integer; each integer identifies the ground truth.
     """
+    print('Determining list of input files and labels from %s.' % data_dir)
+    unique_labels = [l.strip() for l in tf.gfile.GFile(
+        labels_file, 'r').readlines()]
+
+    labels = []
+    filenames = []
+    texts = []
+    # Leave label index 0 empty as a background class.
+    label_index = 0
+
+    # Construct the list of WAV files and labels.
+    for text in unique_labels:
+        file_path = '%s/%s/*.wav' % (data_dir, text)
+        matching_files = tf.gfile.Glob(file_path)
+
+        labels.extend([label_index] * len(matching_files))
+        texts.extend([text] * len(matching_files))
+        filenames.extend(matching_files)
+
+        # if not label_index % 100:
+        #     print('Finished finding files in %d of %d classes.' % (label_index, len(labels)))
+        label_index += 1
+
+    # Shuffle the ordering of all image files in order to guarantee
+    # random ordering of the images with respect to label in the
+    # saved TFRecord files. Make the randomization repeatable.
+    shuffled_index = list(range(len(filenames)))
+    random.seed(12345)
+    random.shuffle(shuffled_index)
+
+    filenames = [filenames[i] for i in shuffled_index]
+    texts = [texts[i] for i in shuffled_index]
+    labels = [labels[i] for i in shuffled_index]
+
+    print('Found %d WAV files across %d labels inside %s.' %
+            (len(filenames), len(unique_labels), data_dir))
+
+    return filenames, texts, labels
+
+def _create_TFRecord_miniprocess(args):
+    global counter
+    state, filenames, labels, num_shards, shard_idx, file_begin, file_end = args
+    output_filename = '%s-%.5d-of-%.5d' % (state, shard_idx, num_shards)
+    output_file = os.path.join(FLAGS.output_directory, output_filename)
+    writer = tf.python_io.TFRecordWriter(output_file)
+
+    for i in range(file_begin, file_end):
+        filename = filenames[i]
+        label = labels[i]
+        try:
+            with tf.gfile.GFile(filename, 'rb') as f:
+                audio_binary = f.read()
+        except Exception as e:
+            print(e)
+            print('SKIPPED: Unexpected error while reading %s.' % filename)
+            continue
+        example = _encode_example(filename, audio_binary, label)
+        writer.write(example.SerializeToString())
+    with counter.get_lock():
+        counter.value += 1
+    print('%s: (%.5d/%.5d) Write %d file to shard %s' %
+                        (datetime.now(), counter.value, num_shards, file_end-file_begin, output_filename))
+    sys.stdout.flush()
+
+def _create_TFRecord(state, filenames, texts, labels, num_shards):# Launch a thread for each batch.
+    global counter
+    print('%s: Create TFRecord from %d files, write into %d shards, using %d threads' % (state, len(filenames), num_shards, FLAGS.num_threads))
     assert len(filenames) == len(texts)
     assert len(filenames) == len(labels)
 
-    # Break all images into batches with a [ranges[i][0], ranges[i][1]].
-    spacing = np.linspace(0, len(filenames), FLAGS.num_threads + 1).astype(np.int)
-    ranges = []
-    for i in range(len(spacing) - 1):
-        ranges.append([spacing[i], spacing[i + 1]])
-
-    # Launch a thread for each batch.
-    print('Launching %d threads for spacings: %s' % (FLAGS.num_threads, ranges))
+    thread_args = []
+    spacing = np.linspace(0, len(filenames), num_shards + 1).astype(np.int)
+    counter = Value('i', 0)
+    for i in range(num_shards):
+        thread_args.append((state, filenames, labels, num_shards, i+1, spacing[i], spacing[i + 1]))
+    p = Pool(FLAGS.num_threads)
+    p.map(_create_TFRecord_miniprocess, thread_args)
     sys.stdout.flush()
 
-    # Create a mechanism for monitoring when all threads are finished.
-    coord = tf.train.Coordinator()
+def Folders_to_TFRecords(train_directory, validation_directory, output_directory, labels_file, train_shards, validation_shards, worker=None):
+    global FLAGS
+    FLAGS = init_flags(train_directory, validation_directory, output_directory, train_shards, validation_shards, labels_file, worker)
+    filenames_train, texts_train, labels_train = _find_dataset(train_directory, FLAGS.labels_file)
+    filenames_valid, texts_valid, labels_valid = _find_dataset(validation_directory, FLAGS.labels_file)
+    _create_TFRecord('train', filenames_train, texts_train, labels_train, FLAGS.train_shards)
+    _create_TFRecord('valid', filenames_valid, texts_valid, labels_valid, FLAGS.validation_shards)
 
-    threads = []
-    for thread_index in range(len(ranges)):
-        args = (thread_index, ranges, name, filenames,
-                texts, labels, num_shards)
-        t = threading.Thread(target=_process_sound_files_batch, args=args)
-        t.start()
-        threads.append(t)
-
-    # Wait for all the threads to terminate.
-    coord.join(threads)
-    print('%s: Finished writing all %d images in data set.' %
-            (datetime.now(), len(filenames)))
-    sys.stdout.flush()
-
-def _find_dataset():
-    raise NotImplementedError
-
-def Folders_to_TFRecords(train_directory, validation_directory, output_directory, train_shards, validation_shards, worker=None):
-    init_flags(train_directory, validation_directory, output_directory, train_shards, validation_shards,worker)
-    filenames_train, labels_train = _find_dataset(train_directory)
-    filenames_valid, labels_valid = _find_dataset(validation_directory)
-    _process_sound_files('train', filenames_train, labels_train, FLAGS.train_shards)
-    _process_sound_files('train', filenames_valid, labels_valid, FLAGS.validation_shards)
-
-def TFRecords_to_TFDataset(directory, format_file, process_fn=None, worker=None, buffer_size=1024):
+def TFRecords_to_TFDataset(directory, format_file, process_fn=None, worker=None, buffer_size=None):
     def _decode_example(example):
         feature={
             'sound/buffer': tf.FixedLenFeature([], tf.string),
@@ -193,14 +270,49 @@ def TFRecords_to_TFDataset(directory, format_file, process_fn=None, worker=None,
     dataset = tf.data.TFRecordDataset(file_names, buffer_size=buffer_size, num_parallel_reads=worker).map(_decode_example)
     return dataset
 
-def TFDataset_to_InputFn(dataset, shape, num_classes, batch_size, shuffle_size=1024, prefetch_size=32, repeat_times=None):
-    def get_inputs(dataset, shape, num_classes, batch_size, shuffle_size, prefetch_size, repeat):
+def TFDataset_to_InputFn(dataset, num_classes, batch_size, shuffle_size=1024, prefetch_size=32, repeat_times=None):
+    def get_inputs(dataset, num_classes, batch_size, shuffle_size, prefetch_size, repeat):
         dataset = dataset.shuffle(shuffle_size)
         dataset = dataset.repeat(repeat_times)  # repeat indefinitely
         dataset = dataset.batch(batch_size)
         dataset = dataset.prefetch(prefetch_size)
-        image, label = dataset.make_one_shot_iterator().get_next()
-        image = tf.reshape(image, shape)
-        label = tf.one_hot(label, num_classes)
-        return image, label
-    return lambda:get_inputs(dataset,shape, num_classes, batch_size, shuffle_size, prefetch_size, repeat_times)
+        wav_data, label = dataset.make_one_shot_iterator().get_next()  
+        label = tf.one_hot(tf.dtypes.cast(tf.string_to_number(label), tf.int32), num_classes)
+        return wav_data, label
+    return lambda:get_inputs(dataset, num_classes, batch_size, shuffle_size, prefetch_size, repeat_times)
+
+def TFRecords_to_InputFn(directory, format_file, num_classes, process_fn=None, worker=1, 
+                            batch_size=4 ,buffer_size=None, shuffle_size=1024, repeat_times=1):
+    def _decode_example(example):
+        feature={
+            'sound/buffer': tf.FixedLenFeature([], tf.string),
+            'sound/filename': tf.FixedLenFeature([], tf.string),
+            'sound/label': tf.FixedLenFeature([], tf.string)
+        }
+        parsed = tf.parse_single_example(example, feature)
+        # write sound decoder
+        sound_buffer = parsed["sound/buffer"]
+        wav_data = contrib_audio.decode_wav(sound_buffer, desired_channels=1)
+    
+
+        if process_fn is not None:
+            wav_data = process_fn(wav_data)
+        label = parsed["sound/label"]
+        return wav_data, label
+
+    def get_inputs(dataset, num_classes):
+        wav_data, label = dataset.make_one_shot_iterator().get_next()  
+        label = tf.one_hot(tf.dtypes.cast(tf.string_to_number(label), tf.int32), num_classes)
+        return wav_data, label
+    if buffer_size is None:
+        buffer_size=batch_size*worker
+    file_names = tf.data.Dataset.list_files(os.path.join(directory, format_file))
+    dataset = tf.data.TFRecordDataset(file_names, buffer_size=buffer_size, num_parallel_reads=worker*batch_size)
+    dataset = dataset.shuffle(shuffle_size)
+    dataset = dataset.repeat(repeat_times)
+    dataset = dataset.apply(tf.contrib.data.map_and_batch(
+        map_func=_decode_example, 
+        batch_size=batch_size,
+        num_parallel_batches=worker))
+    dataset = dataset.prefetch(batch_size)
+    return lambda:get_inputs(dataset, num_classes)

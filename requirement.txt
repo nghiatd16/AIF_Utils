@@ -2,3 +2,6 @@ tensorflow
 numpy
 opencv-python
 opencv-contrib-python
+scikit-image
+py-cpuinfo
+scikit-learn

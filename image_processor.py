@@ -1,9 +1,26 @@
+'''
+An package that help you easily process image datasets efficiently and quickly with multiprocessing\n
+AIF_Utils \n
+Author: nghiatd_16 \n
+'''
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
 import cv2
 import os
 import subprocess
 import time
 from multiprocessing import Pool
 from sklearn.model_selection import train_test_split
+import cpuinfo
+from skimage import exposure
+from skimage import data, img_as_float
+import warnings
+import numpy as np
+import logging
+logging.basicConfig(format='[%(levelname)s|%(asctime)s] %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
+level=logging.DEBUG)
 def find_images(path):
     path = os.path.abspath(path)
     assert os.path.isdir(path), ("No such a directory")
@@ -46,6 +63,7 @@ def _execute_image_profn(process_fn, input_path, output_path):
     img = process_fn(img)
     if img is not None:
         cv2.imwrite(output_path, img)
+    del img
 
 def resize_dataset(lst_imgs, desired_size, output_dir=None, worker=None):
     if worker is None:
@@ -91,6 +109,7 @@ def multi_processing_list(lst_imgs, process_fn, output_dir=None, worker=None):
     os.makedirs(output_dir)
     total = len(lst_imgs)
     lst_args = []
+    print("Num of parallel workers: {}".format(worker))
     for i in range(total):
         name = os.path.basename(lst_imgs[i]) + "_{}.jpg".format(i)
         out_path = os.path.join(output_dir, name)
@@ -105,13 +124,32 @@ def multi_processing_dataset(dataset, process_fn, output_dir=None, worker=None):
         dir_name = dataset['root_path']
         output_dir = os.path.join(os.path.dirname(dir_name), "{}_OutFolder".format(time.time()))
         os.makedirs(output_dir)
+    print("Num of parallel workers: {}".format(worker))
+    lst_args = []
     for label in dataset:
         if label == "root_path": continue
         lst_imgs = dataset[label]
-        multi_processing_list(lst_imgs, process_fn, os.path.join(output_dir, label))
+        
+        class_path = os.path.join(output_dir, label)
+        os.makedirs(class_path)
+        total = len(lst_imgs)
+        
+        for i in range(total):
+            name = os.path.basename(lst_imgs[i]) + "_{}.jpg".format(i)
+            out_path = os.path.join(class_path, name)
+            lst_args.append((process_fn, lst_imgs[i], out_path))
+    p = Pool(worker)
+    p.map(_multi_run_wrapper, lst_args)
 def __deffn(img):
     return img
+def show_cpu_info():
+    logging.info("Getting processor info")
+    cpu_info = cpuinfo.get_cpu_info()
+    brand = cpu_info['brand']
+    count = cpu_info['count']
+    logging.info("Processor Info:\nBrand: {}\nNum cores: {}\n".format(brand, count))
 def split_train_test_dataset(dataset, test_size, output_dir=None, worker=None):
+    
     if output_dir is None:
         dir_name = dataset['root_path']
         output_dir = os.path.join(os.path.dirname(dir_name), "{}_OutFolder".format(time.time()))
@@ -130,3 +168,22 @@ def split_train_test_dataset(dataset, test_size, output_dir=None, worker=None):
         lst_test_output_dir = os.path.join(output_dir, os.path.dirname(os.path.dirname(label)), "{}_test".format(label))
         print(lst_test_output_dir)
         multi_processing_list(X_test, __deffn, lst_test_output_dir, worker)
+
+def histogram_expose_img(img):
+    img = cv2.resize(img, (40, 40))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        img_eq = exposure.equalize_hist(img)
+
+        # Adaptive Equalization
+        img_adapteq = exposure.equalize_adapthist(img, clip_limit=0.03)
+    show_img = img_adapteq*255
+    show_img = show_img.astype(np.uint8)
+    return show_img
+
+if __name__ == "__main__":
+    location = 'E:\\Workspace\AIF\\AIF_Challenge\\TrafficSignClassification\\data\\public_test'
+    destination = 'E:\\Workspace\\AIF\\AIF_Challenge\\TrafficSignClassification\\data\\processed_test'
+    show_cpu_info()
+    images = find_images(location)
+    multi_processing_list(images, output_dir=destination, process_fn=histogram_img)

@@ -1,89 +1,82 @@
-import numpy as np
-import cv2
+from image_processor import discover_image_dataset
+from image_processor import histogram_expose_img, multi_processing_dataset
+from image_tf_records_loader import Folders_to_TFRecords, TFRecords_to_TFDataset
 import tensorflow as tf
-import os
-def _bytes_feature(value):
-    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+from tensorflow import keras
+import numpy as np
+import warnings
+from skimage import exposure
+import cv2
+tf.enable_eager_execution()
 
-def _int64_feature(value):
-    return tf.train.Feature(int64_list=tf.train.Int64List(value=[value]))
-def _decode_data(serialized_example):
-    features = tf.parse_single_example(
-    serialized_example,
-    # Defaults are not specified since both keys are required.
-    features={
-        'height': tf.FixedLenFeature([], tf.int64),
-        'width': tf.FixedLenFeature([], tf.int64),
-        'channel': tf.FixedLenFeature([], tf.int64),
-        'img': tf.FixedLenFeature([], tf.string),
-        'label': tf.FixedLenFeature([], tf.string)
-    })
-    # height = tf.cast(features['height'], tf.int32)
-    # width = tf.cast(features['width'], tf.int32)
-    # channel = tf.cast(features['channel'], tf.int32)
-    # print(sess.run(channel))
-    # exit(-1)
-    image = tf.image.decode_image(features['img'])
-    label = tf.cast(features['label'], tf.string)
-    return image, label
-directory = "train"
-file_names = tf.data.Dataset.list_files(os.path.join(directory, "train-*"))
-dataset = tf.data.TFRecordDataset(file_names).map(_decode_data).batch(2).repeat().make_one_shot_iterator()
-# print(dataset)
-# print(files)
-#session
-config = tf.ConfigProto(device_count = {"GPU":0})
-sess = tf.Session(config=config)
-# print(sess.run(files))
-# # np_img = sess.run(img)
-# # tfr_file_names = 'test.tfrecord'
-# file_names = ['test.tfrecord','test2.tfrecord']
-# dataset = tf.data.TFRecordDataset(file_names).map(_decode_data).batch(2).repeat().make_one_shot_iterator()
-sample = dataset.get_next()
-img, label = sess.run(sample)
-# img = img[0]
-label = np.array(list(map(lambda x: x.decode('utf-8'), label)))
-print(label)
-# print(img)
-# print(type(img))
-# cv2.imshow("tmp", img)
-# cv2.waitKey(0)
-# sample = dataset.get_next()
-# img, label = sess.run(sample)
-# img = img[0]
-# # print(img)
-# # print(type(img))
-# cv2.imshow("tmp", img)
-# cv2.waitKey(0)
-# label = label[0].decode('utf-8')
-# print(img)
-# print(type(img))
-# print(label)
-# print(type(label))
-# writer = tf.python_io.TFRecordWriter(tfr_file_names)
-# # original_img = cv2.imread("test2.jpg")
-# label = "test"
-# # h,w,c = original_img.shape
-# # img_string = original_img.tostring()
+def preprocess_data(image):
+    image = image.numpy()
+    # image = cv2.resize(image, (40, 40))
+    image = keras.preprocessing.image.random_shift(image, 0.2, 0.2)
+    image = keras.preprocessing.image.random_rotation(image, 20)
+    return image
 
+def model():
+    net = keras.models.Sequential()
+    # net.add(keras.layers.Lambda(augment_2d,
+    #                 input_shape=(64,64,3),
+    #                 arguments={'rotation': 8.0, 'horizontal_flip': True}))
+    net.add(keras.layers.Conv2D(32, (3, 3), input_shape=IMAGE_SHAPE, padding='same'))
+    net.add(keras.layers.Activation('relu'))
+    net.add(keras.layers.Conv2D(32, (3, 3)))
+    net.add(keras.layers.Activation('relu'))
+    net.add(keras.layers.MaxPooling2D(pool_size=(2, 2)))
+    net.add(keras.layers.Dropout(0.25))
 
-# filename = "test.jpg"
-# with tf.gfile.GFile(filename, 'rb') as f:
-#     image_data = f.read()
-# img = tf.image.decode_image(image_data)
-# img = sess.run(img)
-# h, w, c = img.shape
-# feature = {
-#     'width': _int64_feature(w),
-#     'height': _int64_feature(h),
-#     'channel': _int64_feature(c),
-#     'img': _bytes_feature(image_data),
-#     'label': _bytes_feature(tf.compat.as_bytes(label))
-# }
-# example = tf.train.Example(features=tf.train.Features(feature=feature))
-# writer.write(example.SerializeToString())
-# writer.close()
-# img = tf.image.decode_image(image_data, channels=3)
+    net.add(keras.layers.Conv2D(64, (3, 3), padding='same'))
+    net.add(keras.layers.Activation('relu'))
+    net.add(keras.layers.Conv2D(64, (3, 3)))
+    net.add(keras.layers.Activation('relu'))
+    net.add(keras.layers.MaxPooling2D(pool_size=(2, 2)))
+    net.add(keras.layers.Dropout(0.25))
 
-# cv2.imshow("tmp",np_img)
-# cv2.waitKey(0)
+    net.add(keras.layers.Flatten())
+    net.add(keras.layers.Dense(units=512))
+    net.add(keras.layers.Activation('relu'))
+    net.add(keras.layers.Dropout(0.5))
+    net.add(keras.layers.Dense(units=N_CLASSES))
+    net.add(keras.layers.Activation('softmax'))
+    return net
+
+BATCH_SIZE = 32
+N_CLASSES = 43
+LR = 0.001
+N_EPOCHS = 30
+N_UNITS = 128
+IMAGE_SHAPE = (40,40,3)
+import json
+if __name__ == "__main__":
+    
+    sample_data_path = 'E:\\Workspace\\AIF\AIF_Challenge\\test_tf_records_loader\\init_train'
+    processed_sample_path = 'E:\\Workspace\\AIF\AIF_Challenge\\test_tf_records_loader\\processed_train'
+    
+    TFRecord_path = 'E:\\Workspace\\AIF\AIF_Challenge\\test_tf_records_loader\\train_tfrecord'
+    maping_file = 'E:\\Workspace\\AIF\\AIF_Challenge\\test_tf_records_loader\\train_tfrecord\\_mapping.json'
+    # dataset = discover_image_dataset(sample_data_path)
+    # multi_processing_dataset(dataset, process_fn = histogram_expose_img, output_dir=processed_sample_path)
+    # Folders_to_TFRecords(train_directory=processed_sample_path, output_directory=TFRecord_path, train_shards=1)
+    TFDataset = TFRecords_to_TFDataset(TFRecord_path, filename_pattern="train-*", process_fn=preprocess_data, worker=12)
+    TFIterator = TFDataset.batch(1).repeat(N_EPOCHS).make_one_shot_iterator()
+    # images, labels = TFIterator.get_next()
+    mapping_label = json.load(open(maping_file, 'r'))
+    while True:
+        img, lb = TFIterator.get_next()
+        img = img[0].numpy().astype(np.uint8)
+        print(img)
+        lb = int(lb[0])
+        print(type(img))
+        cv2.imshow("tmp", img)
+        print(mapping_label[str(lb)])
+        if cv2.waitKey(0) == ord('q'):
+            break
+    # my_model = keras.applications.DenseNet201(include_top=False, weights=None, input_shape=IMAGE_SHAPE, classes=N_CLASSES)
+    # my_model.compile(loss=keras.losses.sparse_categorical_crossentropy,
+    #           optimizer=keras.optimizers.Adadelta(),
+    #           metrics=['accuracy'])
+    # my_model.fit(TFIterator, epochs=10, steps_per_epoch=1300//BATCH_SIZE)
+    # my_model.save("my_model.hdf5")
